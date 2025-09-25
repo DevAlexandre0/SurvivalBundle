@@ -8,6 +8,7 @@ author 'YourTeam'
 version '0.1.0'
 
 shared_scripts {
+  '@survival_shared/framework.lua',
   '@ox_lib/init.lua',
   'config.lua',
   'shared/health_shared.lua'
@@ -18,7 +19,6 @@ client_scripts {
 }
 
 server_scripts {
-  'server/adapters/qb.lua',
   'server/health.lua'
 }
 

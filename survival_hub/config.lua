@@ -5,6 +5,9 @@ Config.LogPrefix = '[survival_hub]'
 Config.BroadcastEnabled = true
 
 Config.FrameworkPriority = { 'qbox', 'qb', 'esx', 'standalone' }
+Config.AdapterPermissions = {
+    admin = { 'ace:survival.hub' }
+}
 Config.Namespaces = { 'movement', 'needs', 'health', 'bio', 'env' }
 
 Config.Clamps = {

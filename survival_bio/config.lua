@@ -38,4 +38,9 @@ Config.Persistence = {
     saveIntervalSec = 60
 }
 
-Config.Adapter = 'qb'
+Config.Framework = {
+    priority = { 'qbox', 'qb', 'ox', 'esx', 'standalone' },
+    permissions = {
+        medical = { 'job:ambulance', 'job:ems', 'ace:survival.bio' }
+    }
+}

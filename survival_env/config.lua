@@ -33,4 +33,9 @@ Config.Persistence = 'oxmysql'
 Config.Debug = true
 Config.LogPrefix = '[survival_env] '
 
-Config.Framework = { 'qb' }
+Config.Framework = {
+  priority = { 'qbox', 'qb', 'ox', 'esx', 'standalone' },
+  permissions = {
+    staff = { 'ace:survival.env' }
+  }
+}
