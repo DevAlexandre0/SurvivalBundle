@@ -20,6 +20,9 @@ Config.DropPacketsOnThrottle = true
 -- Logging
 Config.Debug = true
 
--- Adapter selection is automatic; you can force one:
--- Config.Adapter = 'auto' | 'standalone' | 'esx' | 'qb' | 'ox'
-Config.Adapter = 'auto'
+Config.Framework = {
+  priority = { 'qbox', 'qb', 'ox', 'esx', 'standalone' },
+  permissions = {
+    admin = { 'ace:survival.movement' }
+  }
+}

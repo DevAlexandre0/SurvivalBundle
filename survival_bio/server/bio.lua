@@ -1,6 +1,15 @@
+local Adapter = SurvivalFramework.buildAdapter({
+    priority = Config.Framework and Config.Framework.priority,
+    permissions = Config.Framework and Config.Framework.permissions
+})
+
 local function debugLog(fmt, ...)
     if not Config.Debug then return end
-    print(('%s %s'):format(Config.DebugPrefix or '[BIO]', fmt:format(...)))
+    if select('#', ...) > 0 then
+        print(('%s %s'):format(Config.DebugPrefix or '[BIO]', fmt:format(...)))
+    else
+        print(('%s %s'):format(Config.DebugPrefix or '[BIO]', tostring(fmt)))
+    end
 end
 
 local function ensureSource(src)
@@ -14,17 +23,17 @@ end
 local function clamp01(x) return math.max(0.0, math.min(100.0, x)) end
 local function nearly(a, b, eps) return math.abs(a - b) <= (eps or Config.DeltaEpsilon) end
 
-local Adapter = require(('adapters/%s'):format(Config.Adapter or 'qb'))
-
 local Bio = {}
+local pendingSave = {}
+local hasOx = GetResourceState and GetResourceState('oxmysql') == 'started' and MySQL ~= nil
 
 local function dbReady()
-    return Config.Persistence.enabled and GetResourceState('oxmysql') == 'started' and MySQL ~= nil
+    return Config.Persistence.enabled and hasOx
 end
 
 local function dbEnsure()
-    if not dbReady() or _BIO_DB_READY then return end
-    local createSql = ([[
+    if not dbReady() or Bio._schemaReady then return end
+    MySQL.query.await(([[
         CREATE TABLE IF NOT EXISTS `%s` (
             identifier VARCHAR(64) NOT NULL,
             infection FLOAT NOT NULL,
@@ -33,11 +42,11 @@ local function dbEnsure()
             immunity  FLOAT NOT NULL,
             metabolism FLOAT NOT NULL,
             stomach   FLOAT NOT NULL,
+            ts INT NOT NULL,
             PRIMARY KEY (identifier)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    ]]):format(Config.Persistence.table)
-    MySQL.query.await(createSql)
-    _BIO_DB_READY = true
+    ]]):format(Config.Persistence.table))
+    Bio._schemaReady = true
 end
 
 local function idOf(src)
@@ -51,30 +60,44 @@ local function dbLoad(src)
     return MySQL.single.await(('SELECT * FROM `%s` WHERE identifier = ?'):format(Config.Persistence.table), { identifier })
 end
 
-local function dbSave(src, state)
-    if not dbReady() then return end
+local function dbSave(identifier, state)
+    if not dbReady() or not identifier then return end
     dbEnsure()
-    local identifier = idOf(src)
-    MySQL.prepare.await(([[ 
-        INSERT INTO `%s` (identifier, infection, parasite, disease, immunity, metabolism, stomach)
-        VALUES (?,?,?,?,?,?,?)
-        ON DUPLICATE KEY UPDATE
-            infection = VALUES(infection),
-            parasite  = VALUES(parasite),
-            disease   = VALUES(disease),
-            immunity  = VALUES(immunity),
-            metabolism= VALUES(metabolism),
-            stomach   = VALUES(stomach)
-    ]]):format(Config.Persistence.table), {
-        identifier,
-        state.infection,
-        state.parasite,
-        state.disease,
-        state.immunity,
-        state.metabolism,
-        state.stomach,
-    })
+    pendingSave[identifier] = state
 end
+
+CreateThread(function()
+    while true do
+        Wait((Config.Persistence.saveIntervalSec or 60) * 1000)
+        if dbReady() and next(pendingSave) ~= nil then
+            local batch = pendingSave
+            pendingSave = {}
+            for identifier, state in pairs(batch) do
+                MySQL.prepare.await(([[
+                    INSERT INTO `%s` (identifier, infection, parasite, disease, immunity, metabolism, stomach, ts)
+                    VALUES (?,?,?,?,?,?,?,?)
+                    ON DUPLICATE KEY UPDATE
+                        infection = VALUES(infection),
+                        parasite  = VALUES(parasite),
+                        disease   = VALUES(disease),
+                        immunity  = VALUES(immunity),
+                        metabolism= VALUES(metabolism),
+                        stomach   = VALUES(stomach),
+                        ts        = VALUES(ts)
+                ]]):format(Config.Persistence.table), {
+                    identifier,
+                    state.infection,
+                    state.parasite,
+                    state.disease,
+                    state.immunity,
+                    state.metabolism,
+                    state.stomach,
+                    state.ts or os.time(),
+                })
+            end
+        end
+    end
+end)
 
 local function defaultState()
     return {
@@ -108,6 +131,7 @@ local function pushState(src, st, force)
             immunity = st.immunity,
             metabolism = st.metabolism,
             stomach = st.stomach,
+            ts = st.ts or os.time()
         }, true)
         if Config.Broadcast then
             TriggerClientEvent('survival:bio:progress', src, ply.state.bio)
@@ -128,6 +152,7 @@ RegisterNetEvent('survival:bio:exposure', function(payload)
 
     st.infection = clamp01(st.infection + dirtyWater * 0.2 + woundInfx * 0.4)
     st.parasite  = clamp01(st.parasite  + rawFood * 0.4 + dirtyWater * 0.1)
+    st.ts = os.time()
     pushState(src, st, false)
 
     if Config.Debug then
@@ -147,11 +172,17 @@ RegisterNetEvent('survival:bio:treated', function(payload)
     local st = Bio[src]
     if not st then return end
 
+    if not Adapter.hasPermission(src, 'medical') then
+        debugLog('blocked treatment from %d (no permission)', src)
+        return
+    end
+
     local typ = tostring(payload.type or 'generic')
     if typ == 'antibiotic' then st.infection = clamp01(st.infection - 25.0) end
     if typ == 'antiparasitic' then st.parasite = clamp01(st.parasite - 25.0) end
     if typ == 'antipyretic' then st.disease = clamp01(st.disease - 15.0) end
     st.immunity = clamp01(st.immunity + 10.0)
+    st.ts = os.time()
     pushState(src, st, true)
 end)
 
@@ -173,7 +204,9 @@ exports('SetBioFlag', function(src, key, val)
     local st = Bio[src]
     if not st or st[key] == nil then return false end
     st[key] = clamp01(tonumber(val) or st[key])
+    st.ts = os.time()
     pushState(src, st, true)
+    dbSave(idOf(src), st)
     return true
 end)
 
@@ -198,7 +231,7 @@ local function tickPlayer(src)
     if not st then return end
     local up = snapshotUpstream(src)
 
-    local infectedRisk = (up.health and (up.health.bleeding or 0) or 0) + (up.env and (up.env.wetness or 0) or 0)
+    local infectedRisk = (up.health and (up.health.bleed or up.health.bleeding or 0) or 0) + (up.env and (up.env.wetness or 0) or 0)
     local parasiteRisk = ((up.needs and (100 - (up.needs.water or 100))) or 0) * 0.01
     local sickLoad = (st.infection * 0.5 + st.parasite * 0.4) / 100.0
 
@@ -211,12 +244,14 @@ local function tickPlayer(src)
 
     st.metabolism = clamp01(100.0 * Config.Coeff.metabolismBase * (1.0 - sickLoad * 0.5))
     st.stomach = clamp01(st.stomach - (Config.Coeff.stomachEmpty / 60.0))
+    st.ts = os.time()
 
     if st.disease >= Config.Threshold.Symptomatic then
         TriggerClientEvent('survival:bio:progress', src, { symptomatic = true, disease = st.disease })
     end
 
     pushState(src, st, false)
+    dbSave(idOf(src), st)
 end
 
 CreateThread(function()
@@ -230,18 +265,7 @@ CreateThread(function()
     end
 end)
 
-CreateThread(function()
-    while true do
-        Wait((Config.Persistence.saveIntervalSec or 60) * 1000)
-        if dbReady() then
-            for src, st in pairs(Bio) do
-                dbSave(src, st)
-            end
-        end
-    end
-end)
-
-AddEventHandler('playerJoining', function(src)
+local function initPlayer(src)
     if type(src) ~= 'number' or src <= 0 then return end
     local st = defaultState()
     if dbReady() then
@@ -253,25 +277,38 @@ AddEventHandler('playerJoining', function(src)
             st.immunity = row.immunity
             st.metabolism = row.metabolism
             st.stomach = row.stomach
+            st.ts = row.ts or os.time()
         end
     end
     Bio[src] = st
     pushState(src, st, true)
-    debugLog('init player %d adapter=%s', src, Adapter.name or 'unknown')
+    debugLog('initialised player %d adapter=%s', src, Adapter.name or 'unknown')
+end
+
+AddEventHandler('playerJoining', function(src)
+    initPlayer(src)
 end)
 
-AddEventHandler('playerDropped', function()
-    local src = source
+Adapter.onPlayerLoaded(function(src)
+    initPlayer(src)
+end)
+
+local function handleDrop(src)
     if type(src) ~= 'number' or src <= 0 then return end
     local st = Bio[src]
-    if st and dbReady() then
-        dbSave(src, st)
+    if st then
+        dbSave(idOf(src), st)
     end
     Bio[src] = nil
+end
+
+Adapter.onPlayerDropped(handleDrop)
+AddEventHandler('playerDropped', function()
+    handleDrop(source)
 end)
 
 AddEventHandler('onResourceStart', function(res)
     if res ~= GetCurrentResourceName() then return end
     if dbReady() then dbEnsure() end
-    debugLog('resource started adapter=%s', Adapter.name or 'unknown')
+    debugLog('resource started adapter=%s hasOx=%s', Adapter.name or 'unknown', tostring(hasOx))
 end)

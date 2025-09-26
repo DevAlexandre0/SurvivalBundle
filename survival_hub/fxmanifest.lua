@@ -7,6 +7,7 @@ description 'Qbox-only survival hub: state bus + persistence'
 version '0.3.0'
 
 shared_scripts {
+  '@survival_shared/framework.lua',
   'config.lua'
 }
 

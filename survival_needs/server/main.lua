@@ -1,18 +1,36 @@
-local dbg = function(...) if Config.Debug then print(('%s [server] ' .. string.rep('%s ', select('#', ...))):format(Config.DebugPrefix, ...)) end end
+local Adapter = SurvivalFramework.buildAdapter({
+  priority = Config.Framework and Config.Framework.priority,
+  permissions = Config.Framework and Config.Framework.permissions
+})
 
-local needsCache = {}      -- [license] = { food=.., water=.., energy=.., stress=.., poop=.., pee=.. }
-local activityCache = {}   -- [license] = 'idle'
-local lastEventAt = {}     -- rate-limit
+local dbg = function(...)
+  if Config.Debug then
+    print(('%s [server] ' .. string.rep('%s ', select('#', ...))):format(Config.DebugPrefix, ...))
+  end
+end
 
-local function clamp(v) if v < Config.ClampMin then return Config.ClampMin elseif v > Config.ClampMax then return Config.ClampMax else return v end end
+local needsCache = {}
+local activityCache = {}
+local lastEventAt = {}
+
+local function validSource(src)
+  return type(src) == 'number' and src > 0
+end
+
+local function clamp(v)
+  if v < Config.ClampMin then return Config.ClampMin end
+  if v > Config.ClampMax then return Config.ClampMax end
+  return v
+end
 
 local function defaultNeeds()
   return { food=100.0, water=100.0, energy=100.0, stress=10.0, poop=0.0, pee=0.0, ts=os.time() }
 end
 
-local function getLicense(src) return Adapter and Adapter.identify and Adapter.identify(src) or ('src:%s'):format(src) end
+local function getIdentifier(src)
+  return Adapter.getIdentifier(src) or ('src:%s'):format(src)
+end
 
--- Rate-limit helper
 local function rl(key, perMin)
   local now = GetGameTimer()
   local bucket = lastEventAt[key] or {t=0, n=0}
@@ -22,7 +40,6 @@ local function rl(key, perMin)
   return bucket.n <= perMin
 end
 
--- Apply one-second tick
 local function applyTick(license, activity)
   local n = needsCache[license] or defaultNeeds()
   local mult = Config.Activity[activity or 'idle'] or Config.Activity.idle
@@ -32,12 +49,11 @@ local function applyTick(license, activity)
   local dEnergy = (mult.energy or 0.0)
   local dStress = Config.Decay.stress * (mult.stress or 1.0)
 
-  -- Bowel/Urine timers grow up to 100
   local dPoop = Config.Bowel.poop.base
   local dPee  = Config.Bowel.pee.base
 
   local new = {
-    food   = clamp(n.food  - dFood*100),   -- scale to 0..100 UX; decay is small/sec
+    food   = clamp(n.food  - dFood*100),
     water  = clamp(n.water - dWater*100),
     energy = clamp(n.energy - dEnergy*100),
     stress = clamp(n.stress + dStress*100),
@@ -46,35 +62,26 @@ local function applyTick(license, activity)
     ts     = os.time()
   }
 
-  local delta = {
-    food   = new.food   - n.food,
-    water  = new.water  - n.water,
-    energy = new.energy - n.energy,
-    stress = new.stress - n.stress,
-    poop   = new.poop   - n.poop,
-    pee    = new.pee    - n.pee
-  }
-
   needsCache[license] = new
-  return new, delta
+  return new
 end
 
--- Push to state bag of the player source
 local function pushState(src, data)
   local ply = Player(src)
   if ply and ply.state then
-    ply.state:set('needs', data, true) -- replicated = true
+    ply.state:set('needs', data, true)
   end
 end
 
--- Public exports
 exports('GetNeeds', function(src)
-  local license = getLicense(src)
+  if not validSource(src) then return defaultNeeds() end
+  local license = getIdentifier(src)
   return needsCache[license] or defaultNeeds()
 end)
 
 exports('SetNeeds', function(src, tbl)
-  local license = getLicense(src)
+  if not validSource(src) then return false end
+  local license = getIdentifier(src)
   local n = needsCache[license] or defaultNeeds()
   for k,v in pairs(tbl or {}) do
     if n[k] ~= nil and type(v) == 'number' then
@@ -83,87 +90,114 @@ exports('SetNeeds', function(src, tbl)
   end
   needsCache[license] = n
   pushState(src, n)
+  Persist.save(license, n)
   return true
 end)
 
 exports('AddStress', function(src, amt)
-  local license = getLicense(src)
+  if not validSource(src) then return false end
+  local license = getIdentifier(src)
   local n = needsCache[license] or defaultNeeds()
   n.stress = clamp(n.stress + (amt or 0))
   needsCache[license] = n
   pushState(src, n)
+  Persist.save(license, n)
   return n.stress
 end)
 
--- Receive activity hint from client
 RegisterNetEvent('survival:needs:activity', function(activity)
   local src = source
+  if not validSource(src) then return end
   if not rl(('act:%s'):format(src), Config.RateLimit.clientUpdate) then
     if Config.Debug then dbg('rate-limit activity from', src) end
     return
   end
-  local license = getLicense(src)
-  activityCache[license] = activity
+  local license = getIdentifier(src)
+  activityCache[license] = tostring(activity or 'idle')
 end)
 
--- Join/Drop hooks
-Adapter.onPlayerLoaded(function(src)
-  local license = getLicense(src)
+local function onPlayerLoaded(src)
+  if not validSource(src) then return end
+  local license = getIdentifier(src)
   local saved = Persist.load(license)
   needsCache[license] = saved or defaultNeeds()
   activityCache[license] = 'idle'
   pushState(src, needsCache[license])
   if Config.Debug then dbg('loaded needs for', src, license) end
-end)
+end
 
-Adapter.onPlayerDropped(function(src, reason)
-  local license = getLicense(src)
+local function onPlayerDropped(src, reason)
+  if not validSource(src) then return end
+  local license = getIdentifier(src)
   if needsCache[license] then
     Persist.save(license, needsCache[license])
   end
   needsCache[license] = nil
   activityCache[license] = nil
   if Config.Debug then dbg('dropped', src, reason or '') end
+end
+
+Adapter.onPlayerLoaded(onPlayerLoaded)
+AddEventHandler('playerJoining', function(src)
+  onPlayerLoaded(src)
 end)
 
--- Server tick
+Adapter.onPlayerDropped(onPlayerDropped)
+AddEventHandler('playerDropped', function(reason)
+  onPlayerDropped(source, reason)
+end)
+
 CreateThread(function()
   while true do
     Wait(Config.ServerTickMs)
     for _, src in ipairs(GetPlayers()) do
-      local license = getLicense(src)
-      local activity = activityCache[license] or 'idle'
-      local before = needsCache[license] or defaultNeeds()
-      local after, delta = applyTick(license, activity)
+      src = tonumber(src)
+      if validSource(src) then
+        local license = getIdentifier(src)
+        local activity = activityCache[license] or 'idle'
+        local before = needsCache[license] or defaultNeeds()
+        local after = applyTick(license, activity)
 
-      local bigDelta =
-        math.abs(delta.food)   > Config.DeltaEpsilon or
-        math.abs(delta.water)  > Config.DeltaEpsilon or
-        math.abs(delta.energy) > Config.DeltaEpsilon or
-        math.abs(delta.stress) > Config.DeltaEpsilon or
-        math.abs(delta.poop)   > Config.DeltaEpsilon or
-        math.abs(delta.pee)    > Config.DeltaEpsilon
+        local delta = {
+          food   = after.food   - before.food,
+          water  = after.water  - before.water,
+          energy = after.energy - before.energy,
+          stress = after.stress - before.stress,
+          poop   = after.poop   - before.poop,
+          pee    = after.pee    - before.pee
+        }
 
-      if bigDelta then
-        pushState(src, after)
-        if Config.BroadcastOnDelta then
-          TriggerClientEvent('survival:needs:broadcast', src, delta, after)
+        local bigDelta =
+          math.abs(delta.food)   > Config.DeltaEpsilon or
+          math.abs(delta.water)  > Config.DeltaEpsilon or
+          math.abs(delta.energy) > Config.DeltaEpsilon or
+          math.abs(delta.stress) > Config.DeltaEpsilon or
+          math.abs(delta.poop)   > Config.DeltaEpsilon or
+          math.abs(delta.pee)    > Config.DeltaEpsilon
+
+        if bigDelta then
+          pushState(src, after)
+          if Config.BroadcastOnDelta then
+            TriggerClientEvent('survival:needs:broadcast', src, delta, after)
+          end
         end
       end
     end
   end
 end)
 
--- Manual save timer
 CreateThread(function()
   if not Config.Persistence.Enabled then return end
   while true do
     Wait(Config.Persistence.SaveIntervalSec * 1000)
     local all = {}
     for _, src in ipairs(GetPlayers()) do
-      local license = getLicense(src)
-      if needsCache[license] then
-        all[license] = needsCache[license]
+      src = tonumber(src)
+      if validSource(src) then
+        local license = getIdentifier(src)
+        if needsCache[license] then
+          all[license] = needsCache[license]
+        end
       end
     end
     Persist.saveAll(all)

@@ -37,3 +37,10 @@ Config.MaxBleedTier     = 3
 
 -- logging
 Config.Debug = false
+Config.Framework = {
+  priority = { 'qbox', 'qb', 'ox', 'esx', 'standalone' },
+  permissions = {
+    medical = { 'job:ambulance', 'job:ems', 'ace:survival.health' },
+    admin = { 'ace:survival.health.admin' }
+  }
+}

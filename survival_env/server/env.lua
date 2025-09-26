@@ -1,198 +1,197 @@
+local Adapter = SurvivalFramework.buildAdapter({
+  priority = Config.Framework and Config.Framework.priority,
+  permissions = Config.Framework and Config.Framework.permissions
+})
+
 local rateWindow = {}
 local cache = {}
-local hasOx = GetResourceState('oxmysql') ~= 'missing' and GetResourceState('oxmysql') ~= 'stopped'
+local hasOx = GetResourceState and GetResourceState('oxmysql') == 'started' and MySQL ~= nil
 
-local function dbg(...)
-  if Config.Debug then
-    print(("%s[server] " .. string.rep("%s ", select('#', ...))):format(Config.LogPrefix, ...))
+local function dbg(fmt, ...)
+  if not Config.Debug then return end
+  if select('#', ...) > 0 then
+    print((Config.LogPrefix or '[survival_env]') .. (fmt:format(...)))
+  else
+    print((Config.LogPrefix or '[survival_env]') .. tostring(fmt))
   end
 end
-
--- Qbox-first identifier
-local function getIdentifier(src)
-  -- Qbox
-  if GetResourceState('qbx_core') == 'started' then
-    local ex = exports['qbx_core']
-    if ex and ex.GetPlayer then
-      local p = ex:GetPlayer(src)
-      if p and p.PlayerData and p.PlayerData.citizenid then
-        return ('qb:%s'):format(p.PlayerData.citizenid)
-      end
-    end
-    if exports.qbx_core and exports.qbx_core.GetPlayer then
-      local p2 = exports.qbx_core:GetPlayer(src)
-      if p2 and p2.PlayerData and p2.PlayerData.citizenid then
-        return ('qb:%s'):format(p2.PlayerData.citizenid)
-      end
-    end
-  end
-
-  -- QBCore fallback
-  if GetResourceState('qb-core') == 'started' then
-    local QBCore = exports['qb-core']:GetCoreObject()
-    local Player = QBCore and QBCore.Functions and QBCore.Functions.GetPlayer(src)
-    if Player and Player.PlayerData and Player.PlayerData.citizenid then
-      return ('qb:%s'):format(Player.PlayerData.citizenid)
-    end
-  end
-
-  -- License fallback
-  local lic = GetPlayerIdentifierByType(src, 'license')
-  return lic and ('lic:%s'):format(lic) or ('src:%d'):format(src)
-end
-
--- === Persistence and runtime remain the same ===
-local function dbEnsure()
-  if Config.Persistence ~= 'oxmysql' or not hasOx then return end
-  MySQL.query([[
-    CREATE TABLE IF NOT EXISTS survival_env (
-      id INT AUTO_INCREMENT PRIMARY KEY,
-      identifier VARCHAR(128) NOT NULL,
-      env_json TEXT NOT NULL,
-      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-      UNIQUE KEY uniq_identifier (identifier)
-    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-  ]])
-end
-
-local function dbLoad(id)
-  if Config.Persistence ~= 'oxmysql' or not hasOx then return nil end
-  local row = MySQL.single.await('SELECT env_json FROM survival_env WHERE identifier = ?', { id })
-  if row and row.env_json then
-    local ok, data = pcall(json.decode, row.env_json)
-    if ok then return data end
-  end
-  return nil
-end
-
-local function dbSave(id, data)
-  if Config.Persistence ~= 'oxmysql' or not hasOx then return end
-  MySQL.update.await(
-    'INSERT INTO survival_env (identifier, env_json) VALUES (?, ?) ON DUPLICATE KEY UPDATE env_json = VALUES(env_json)',
-    { id, json.encode(data) }
-  )
-end
-
-AddEventHandler('onResourceStart', function(res)
-  if res ~= GetCurrentResourceName() then return end
-  dbEnsure()
-  dbg('started, persistence=%s, oxmysql=%s', Config.Persistence, tostring(hasOx))
-end)
-
-AddEventHandler('playerJoining', function(src)
-  local id = getIdentifier(src)
-  local loaded = dbLoad(id)
-  cache[src] = loaded or {
-    temp_env = 50.0, temp_body = 50.0, wetness = 0.0, wind = 0.0, precip = 0.0, radiation = 0.0, ts = os.time()
-  }
-  local ply = Player(src)
-  if ply and ply.state then ply.state:set('env', cache[src], true) end
-  dbg('join cache init for %s', id)
-end)
-
-AddEventHandler('playerDropped', function(_, src)
-  local id = getIdentifier(src)
-  if cache[src] then dbSave(id, cache[src]) end
-  cache[src] = nil
-  rateWindow[src] = nil
-end)
 
 local function rateOK(src)
   local now = GetGameTimer()
   rateWindow[src] = rateWindow[src] or {}
-  for i = #rateWindow[src], 1, -1 do
-    if now - rateWindow[src][i] > 60000 then table.remove(rateWindow[src], i) end
+  local bucket = rateWindow[src]
+  bucket[#bucket+1] = now
+  local limit = Config.RateLimitPerMin or 30
+  for i = #bucket, 1, -1 do
+    if now - bucket[i] > 60000 then table.remove(bucket, i) end
   end
-  if #rateWindow[src] >= Config.RateLimitPerMin then return false end
-  table.insert(rateWindow[src], now)
+  if #bucket > limit then return false end
   return true
 end
 
-local function clamp01(x) return math.max(0.0, math.min(100.0, x)) end
+local function clampRange(v, min, max)
+  v = tonumber(v) or 0.0
+  if v < min then return min end
+  if v > max then return max end
+  return v
+end
+
+local function ensureSchema()
+  if Config.Persistence ~= 'oxmysql' or not hasOx then return end
+  MySQL.query.await([[CREATE TABLE IF NOT EXISTS survival_env (
+      identifier VARCHAR(128) NOT NULL PRIMARY KEY,
+      env_json JSON NOT NULL,
+      updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+  ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;]])
+end
+
+local function dbLoad(identifier)
+  if Config.Persistence ~= 'oxmysql' or not hasOx then return nil end
+  local row = MySQL.single.await('SELECT env_json FROM survival_env WHERE identifier = ?', { identifier })
+  if row and row.env_json then
+    local ok, payload = pcall(json.decode, row.env_json)
+    if ok then return payload end
+  end
+  return nil
+end
+
+local function dbSave(identifier, data)
+  if Config.Persistence ~= 'oxmysql' or not hasOx then return end
+  MySQL.prepare.await('INSERT INTO survival_env (identifier, env_json) VALUES (?, ?) ON DUPLICATE KEY UPDATE env_json = VALUES(env_json)', {
+    identifier,
+    json.encode(data)
+  })
+end
 
 local function derive(src, raw)
   local N = Config.Norm
   local dayBlend = (raw.hour >= 6 and raw.hour < 18) and 1.0 or 0.0
   local base = N.BaseNightTemp + (N.BaseDayTemp - N.BaseNightTemp) * dayBlend
+  local precip = math.max(raw.rain, raw.snow)
+  local wind = raw.wind * N.WindFactor
 
-  local precip = math.max(raw.rain or 0.0, raw.snow or 0.0) * 100.0
-  local wind = (raw.wind or 0.0) * N.WindFactor
-
-  local temp_env = base
-  temp_env = temp_env - (raw.snow or 0.0) * N.SnowFactor
-  temp_env = temp_env - wind
-  temp_env = clamp01(temp_env)
-
+  local temp_env = base - raw.snow * N.SnowFactor - wind
   local wetness = cache[src] and cache[src].wetness or 0.0
-  wetness = wetness + (raw.rain or 0.0) * N.RainToWetness
-  wetness = wetness + (raw.subm or 0.0) * N.SubmergeToWet
-  if (raw.rain or 0.0) < 0.05 and (raw.subm or 0.0) < 0.05 and (raw.spd or 0.0) < 1.0 then
+  wetness = wetness + raw.rain * N.RainToWetness
+  wetness = wetness + raw.subm * N.SubmergeToWet
+  if raw.rain < 0.05 and raw.subm < 0.05 and raw.spd < 1.0 then
     wetness = wetness - N.WetnessDryRate
   end
-  wetness = clamp01(wetness)
+  wetness = math.max(0.0, math.min(100.0, wetness))
 
-  local temp_body = temp_env * N.BodyFromEnvK - wetness * N.BodyWetPenalty + (raw.spd or 0.0) * N.SpeedWarmGain
-  temp_body = clamp01(temp_body)
+  local temp_body = temp_env * N.BodyFromEnvK - wetness * N.BodyWetPenalty + raw.spd * N.SpeedWarmGain
 
   local rad = 0.0
   local ped = GetPlayerPed(src)
-  local px,py,pz = table.unpack(GetEntityCoords(ped))
-  for _, z in ipairs(Config.RadiationZones) do
-    local c, r, inten = z[1], z[2], z[3]
-    local dx,dy,dz = (px - c.x), (py - c.y), (pz - c.z)
-    local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
-    if dist <= r then
-      local falloff = 1.0 - (dist / r)
-      rad = math.max(rad, inten * falloff)
+  if ped ~= 0 then
+    local px, py, pz = table.unpack(GetEntityCoords(ped))
+    for _, zone in ipairs(Config.RadiationZones or {}) do
+      local center, radius, intensity = zone[1], zone[2], zone[3]
+      local dx, dy, dz = px - center.x, py - center.y, pz - center.z
+      local dist = math.sqrt(dx*dx + dy*dy + dz*dz)
+      if dist <= radius then
+        local falloff = 1.0 - (dist / radius)
+        rad = math.max(rad, intensity * falloff)
+      end
     end
   end
-  rad = clamp01(rad)
 
   return {
-    temp_env = temp_env,
-    temp_body = temp_body,
-    wetness   = wetness,
-    wind      = clamp01((raw.wind or 0.0) * 10.0),
-    precip    = clamp01(precip),
-    radiation = rad,
-    ts        = os.time()
+    temp_env = clampRange(temp_env, -20.0, 100.0),
+    temp_body = clampRange(temp_body, -20.0, 100.0),
+    wetness = clampRange(wetness, 0.0, 100.0),
+    wind = clampRange(raw.wind * 10.0, 0.0, 100.0),
+    precip = clampRange(precip * 100.0, 0.0, 100.0),
+    radiation = clampRange(rad, 0.0, 100.0),
+    ts = os.time()
   }
+end
+
+local function pushState(src, data)
+  cache[src] = data
+  local ply = Player(src)
+  if ply and ply.state then
+    ply.state:set('env', data, true)
+  end
+end
+
+local function handleJoin(src)
+  if type(src) ~= 'number' or src <= 0 then return end
+  local identifier = Adapter.getIdentifier(src)
+  local snapshot = identifier and dbLoad(identifier) or nil
+  if snapshot then
+    cache[src] = snapshot
+    pushState(src, snapshot)
+  else
+    cache[src] = {
+      temp_env = 50.0,
+      temp_body = 50.0,
+      wetness = 0.0,
+      wind = 0.0,
+      precip = 0.0,
+      radiation = 0.0,
+      ts = os.time()
+    }
+    pushState(src, cache[src])
+  end
+  dbg('initialised env state src=%d id=%s', src, tostring(identifier))
+end
+
+Adapter.onPlayerLoaded(handleJoin)
+AddEventHandler('playerJoining', function(src)
+  handleJoin(src)
+end)
+
+local function handleDrop(src)
+  if type(src) ~= 'number' or src <= 0 then return end
+  local identifier = Adapter.getIdentifier(src)
+  if identifier and cache[src] then
+    dbSave(identifier, cache[src])
+  end
+  cache[src] = nil
+  rateWindow[src] = nil
+end
+
+Adapter.onPlayerDropped(handleDrop)
+AddEventHandler('playerDropped', function(reason)
+  handleDrop(source)
+end)
+
+local function validSource(src)
+  return type(src) == 'number' and src > 0
 end
 
 RegisterNetEvent('survival:env:update', function(raw)
   local src = source
+  if not validSource(src) then return end
   if type(raw) ~= 'table' then return end
-  if not rateOK(src) then dbg('rate limit %d', src); return end
+  if not rateOK(src) then
+    dbg('rate limit drop src=%d', src)
+    return
+  end
 
-  raw.rain = math.max(0.0, math.min(1.0, tonumber(raw.rain or 0.0)))
-  raw.snow = math.max(0.0, math.min(1.0, tonumber(raw.snow or 0.0)))
-  raw.wind = math.max(0.0, math.min(50.0, tonumber(raw.wind or 0.0)))
-  raw.subm = math.max(0.0, math.min(1.0, tonumber(raw.subm or 0.0)))
-  raw.spd  = math.max(0.0, math.min(50.0, tonumber(raw.spd  or 0.0)))
-  raw.hour = math.floor(tonumber(raw.hour or 0) % 24)
+  raw.rain = clampRange(raw.rain, 0.0, 1.0)
+  raw.snow = clampRange(raw.snow, 0.0, 1.0)
+  raw.wind = clampRange(raw.wind, 0.0, 60.0)
+  raw.subm = clampRange(raw.subm, 0.0, 1.0)
+  raw.spd  = clampRange(raw.spd, 0.0, 50.0)
+  raw.hour = math.floor(clampRange(raw.hour or 0.0, 0.0, 23.0))
 
   local derived = derive(src, raw)
-  cache[src] = derived
-
-  local ply = Player(src)
-  if ply and ply.state then ply.state:set('env', derived, true) end
-
-  if (derived.ts % 10) == 0 then
-    dbSave(getIdentifier(src), derived)
+  pushState(src, derived)
+  local identifier = Adapter.getIdentifier(src)
+  if identifier then
+    dbSave(identifier, derived)
   end
 end)
 
 exports('GetEnvState', function(target)
-  target = target or source
+  if not validSource(target) then return nil end
   return cache[target]
 end)
 
-RegisterCommand('env.debug', function(src)
-  local st = cache[src]
-  if st then
-    dbg(('p%d env: te=%.1f tb=%.1f wet=%.1f wind=%.1f pr=%.1f rad=%.1f'):format(
-      src, st.temp_env, st.temp_body, st.wetness, st.wind, st.precip, st.radiation))
-  else
-    dbg('no env cache for '..tostring(src))
-  end
-end, false)
+AddEventHandler('onResourceStart', function(res)
+  if res ~= GetCurrentResourceName() then return end
+  ensureSchema()
+  dbg('started env adapter=%s hasOx=%s', Adapter.name or 'unknown', tostring(hasOx))
+end)

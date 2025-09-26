@@ -47,3 +47,10 @@ Config.Persistence = {
   SaveIntervalSec = 60,
   TableName = 'survival_needs',
 }
+
+Config.Framework = {
+  priority = { 'qbox', 'qb', 'ox', 'esx', 'standalone' },
+  permissions = {
+    staff = { 'ace:survival.needs' }
+  }
+}
