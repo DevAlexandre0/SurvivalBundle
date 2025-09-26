@@ -1,147 +1,23 @@
 local RESOURCE = GetCurrentResourceName()
 
+local Adapter = SurvivalFramework.buildAdapter({
+    priority = Config.FrameworkPriority,
+    permissions = Config.AdapterPermissions
+})
+
+local SNAP, RATE, DIRTY = {}, {}, {}
+local hasOx = GetResourceState and GetResourceState('oxmysql') == 'started' and MySQL ~= nil
+local persistenceTable = Config.Persistence and (Config.Persistence.table or 'survival_states') or 'survival_states'
+
 local function dbg(fmt, ...)
     if not Config.Debug then return end
     local prefix = Config.LogPrefix or ('[' .. RESOURCE .. ']')
-    print(('%s %s'):format(prefix, select('#', ...) > 0 and (fmt:format(...)) or tostring(fmt)))
+    if select('#', ...) > 0 then
+        print(('%s %s'):format(prefix, fmt:format(...)))
+    else
+        print(('%s %s'):format(prefix, tostring(fmt)))
+    end
 end
-
-local function fallbackIdentifier(src)
-    local lic = GetPlayerIdentifierByType(src, 'license')
-    if lic and lic ~= '' then
-        return ('license:%s'):format(lic)
-    end
-    return ('src:%d'):format(src)
-end
-
-local function buildAdapter()
-    local adapters = {}
-
-    adapters.qbox = function()
-        if GetResourceState('qbx_core') ~= 'started' then return nil end
-        local ex = exports['qbx_core']
-        if not ex then return nil end
-        local function fetchPlayer(src)
-            if ex.GetPlayer then
-                local ok, player = pcall(ex.GetPlayer, ex, src)
-                if ok and player then return player end
-            end
-            if ex.GetCoreObject then
-                local ok, core = pcall(ex.GetCoreObject, ex)
-                if ok and core and core.Functions and core.Functions.GetPlayer then
-                    local ok2, player = pcall(core.Functions.GetPlayer, core.Functions, src)
-                    if ok2 and player then return player end
-                end
-            end
-            return nil
-        end
-        return {
-            name = 'qbox',
-            getPlayer = function(src)
-                return fetchPlayer(src)
-            end,
-            getIdentifier = function(src)
-                local player = fetchPlayer(src)
-                local cid = player and player.PlayerData and player.PlayerData.citizenid
-                if cid and cid ~= '' then
-                    return ('qb:%s'):format(cid)
-                end
-                return fallbackIdentifier(src)
-            end,
-        }
-    end
-
-    adapters.qb = function()
-        if GetResourceState('qb-core') ~= 'started' then return nil end
-        local function core()
-            local ok, obj = pcall(function() return exports['qb-core']:GetCoreObject() end)
-            return ok and obj or nil
-        end
-        local cached = core()
-        local function fetchPlayer(src)
-            cached = cached or core()
-            if not cached or not cached.Functions or not cached.Functions.GetPlayer then return nil end
-            local ok, player = pcall(cached.Functions.GetPlayer, cached.Functions, src)
-            if ok and player then return player end
-            return nil
-        end
-        return {
-            name = 'qb-core',
-            getPlayer = function(src)
-                return fetchPlayer(src)
-            end,
-            getIdentifier = function(src)
-                local player = fetchPlayer(src)
-                local cid = player and player.PlayerData and player.PlayerData.citizenid
-                if cid and cid ~= '' then
-                    return ('qb:%s'):format(cid)
-                end
-                return fallbackIdentifier(src)
-            end,
-        }
-    end
-
-    adapters.esx = function()
-        if GetResourceState('es_extended') ~= 'started' then return nil end
-        local ESX
-        local function ensureESX()
-            if ESX then return ESX end
-            local ok, obj = pcall(function()
-                return exports['es_extended']:getSharedObject()
-            end)
-            if ok and obj then ESX = obj end
-            return ESX
-        end
-        return {
-            name = 'es_extended',
-            getPlayer = function(src)
-                local obj = ensureESX()
-                if not obj or not obj.GetPlayerFromId then return nil end
-                local ok, player = pcall(obj.GetPlayerFromId, obj, src)
-                if ok and player then return player end
-                return nil
-            end,
-            getIdentifier = function(src)
-                local obj = ensureESX()
-                if obj and obj.GetIdentifier then
-                    local ok, identifier = pcall(obj.GetIdentifier, obj, src)
-                    if ok and identifier and identifier ~= '' then
-                        return identifier
-                    end
-                end
-                return fallbackIdentifier(src)
-            end,
-        }
-    end
-
-    adapters.standalone = function()
-        return {
-            name = 'standalone',
-            getPlayer = function(_)
-                return nil
-            end,
-            getIdentifier = fallbackIdentifier,
-        }
-    end
-
-    local priority = Config.FrameworkPriority or { 'qbox', 'qb', 'esx', 'standalone' }
-    for _, name in ipairs(priority) do
-        local factory = adapters[name]
-        if factory then
-            local adapter = factory()
-            if adapter then
-                return adapter
-            end
-        end
-    end
-
-    return adapters.standalone()
-end
-
-local Adapter = buildAdapter()
-local SNAP, RATE, DIRTY = {}, {}, {}
-local hasOx = GetResourceState('oxmysql') == 'started' and MySQL ~= nil
-local persistenceTable = Config.Persistence and (Config.Persistence.table or 'survival_states') or 'survival_states'
 
 local function clamp(v, mn, mx)
     if type(v) ~= 'number' then return v end
@@ -155,9 +31,9 @@ local function clampNamespace(ns, delta)
     if not rules then return delta end
     local out = {}
     for k, v in pairs(delta) do
-        local r = rules[k]
-        if r and type(v) == 'number' then
-            out[k] = clamp(v, r[1], r[2])
+        local rule = rules[k]
+        if rule and type(v) == 'number' then
+            out[k] = clamp(v, rule[1], rule[2])
         else
             out[k] = v
         end
@@ -175,23 +51,23 @@ local function mergeDelta(dst, src)
     end
 end
 
-local function ensureSnapshot(src)
-    if not SNAP[src] then
-        SNAP[src] = {
-            identifiers = Adapter.getIdentifier(src),
-            ts = os.time(),
-        }
-        for _, ns in ipairs(Config.Namespaces or {}) do
-            SNAP[src][ns] = SNAP[src][ns] or {}
-        end
-    end
-    return SNAP[src]
-end
-
 local function setStateBag(src, ns, data)
     local ply = Player(src)
     if not ply or not ply.state then return end
     ply.state:set(('survival:%s'):format(ns), data, true)
+end
+
+local function ensureSnapshot(src)
+    if not SNAP[src] then
+        SNAP[src] = {
+            identifier = Adapter.getIdentifier(src),
+            ts = os.time()
+        }
+        for _, ns in ipairs(Config.Namespaces or {}) do
+            SNAP[src][ns] = {}
+        end
+    end
+    return SNAP[src]
 end
 
 local function exceededRate(src, ns, payloadLen)
@@ -200,8 +76,8 @@ local function exceededRate(src, ns, payloadLen)
     local win = (Config.Rate and Config.Rate.windowMs) or 1000
     local bucket = RATE[src][ns]
     if not bucket or now - bucket.t0 > win then
-        RATE[src][ns] = { t0 = now, n = 0, bytes = 0 }
-        bucket = RATE[src][ns]
+        bucket = { t0 = now, n = 0, bytes = 0 }
+        RATE[src][ns] = bucket
     end
     bucket.n = bucket.n + 1
     bucket.bytes = bucket.bytes + (payloadLen or 0)
@@ -214,50 +90,119 @@ end
 
 local function ensureSchema()
     if not hasOx or not Config.Persistence or Config.Persistence.enabled == false then return end
-    local sql = ([[
+    MySQL.query.await(([[
         CREATE TABLE IF NOT EXISTS `%s` (
             `identifier` VARCHAR(128) NOT NULL,
             `snapshot` LONGTEXT NOT NULL,
             `updated_at` TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
             PRIMARY KEY (`identifier`)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4;
-    ]]):format(persistenceTable)
-    MySQL.query.await(sql)
+    ]]):format(persistenceTable))
 end
 
-local function persistOne(src)
+local function loadSnapshot(identifier)
+    if not identifier then return nil end
+    if hasOx and (not Config.Persistence or Config.Persistence.enabled ~= false) then
+        local row = MySQL.single.await(([[SELECT snapshot FROM `%s` WHERE identifier = ? LIMIT 1]]):format(persistenceTable), { identifier })
+        if row and row.snapshot then
+            local ok, decoded = pcall(json.decode, row.snapshot)
+            if ok and decoded then
+                return decoded
+            end
+        end
+    else
+        local prefix = Config.Persistence and Config.Persistence.fileFallbackPrefix or 'survival_state_'
+        local path = ('%s%s.json'):format(prefix, identifier)
+        local blob = LoadResourceFile(RESOURCE, path)
+        if blob then
+            local ok, decoded = pcall(json.decode, blob)
+            if ok and decoded then return decoded end
+        end
+    end
+    return nil
+end
+
+local function persistSnapshot(src)
     local snap = SNAP[src]
-    if not snap or Config.Persistence and Config.Persistence.enabled == false then return end
-    snap.identifiers = Adapter.getIdentifier(src)
-    if hasOx then
-        MySQL.prepare.await(([[ 
+    if not snap then return end
+    snap.identifier = Adapter.getIdentifier(src)
+    if not snap.identifier then return end
+
+    if hasOx and (not Config.Persistence or Config.Persistence.enabled ~= false) then
+        MySQL.prepare.await(([[
             INSERT INTO `%s` (identifier, snapshot)
             VALUES (?, ?)
             ON DUPLICATE KEY UPDATE snapshot = VALUES(snapshot), updated_at = CURRENT_TIMESTAMP
         ]]):format(persistenceTable), {
-            snap.identifiers,
-            json.encode(snap),
+            snap.identifier,
+            json.encode(snap)
         })
     else
-        local prefix = Config.Persistence and Config.Persistence.fileFallbackPrefix or 'snapshot_'
-        local path = ('%s%s.json'):format(prefix, snap.identifiers)
+        local prefix = Config.Persistence and Config.Persistence.fileFallbackPrefix or 'survival_state_'
+        local path = ('%s%s.json'):format(prefix, snap.identifier)
         SaveResourceFile(RESOURCE, path, json.encode(snap), -1)
     end
 end
 
 local function flushDirty()
     for src in pairs(DIRTY) do
-        persistOne(src)
+        persistSnapshot(src)
         DIRTY[src] = nil
     end
 end
 
 CreateThread(function()
+    ensureSchema()
+    local interval = ((Config.Persistence and Config.Persistence.flushIntervalSec) or 30) * 1000
     while true do
-        local interval = (Config.Persistence and Config.Persistence.flushIntervalSec or 30) * 1000
         Wait(interval)
         flushDirty()
     end
+end)
+
+local function applySnapshotToState(src)
+    local snap = SNAP[src]
+    if not snap then return end
+    for _, ns in ipairs(Config.Namespaces or {}) do
+        if snap[ns] then
+            setStateBag(src, ns, snap[ns])
+        end
+    end
+end
+
+local function handleJoin(src)
+    if type(src) ~= 'number' or src <= 0 then return end
+    local identifier = Adapter.getIdentifier(src)
+    local cached = identifier and loadSnapshot(identifier) or nil
+    SNAP[src] = cached or ensureSnapshot(src)
+    SNAP[src].identifier = identifier
+    applySnapshotToState(src)
+    dbg('synced join src=%d adapter=%s identifier=%s', src, Adapter.name or 'unknown', tostring(identifier))
+end
+
+Adapter.onPlayerLoaded(function(src)
+    handleJoin(src)
+end)
+
+Adapter.onPlayerDropped(function(src, reason)
+    if type(src) ~= 'number' or src <= 0 then return end
+    flushDirty()
+    if SNAP[src] then
+        persistSnapshot(src)
+        SNAP[src], RATE[src] = nil, nil
+    end
+    dbg('player dropped src=%d reason=%s', src, tostring(reason))
+end)
+
+AddEventHandler('playerJoining', function(src)
+    handleJoin(src)
+end)
+
+RegisterNetEvent('survival:hub:requestSync', function()
+    local src = source
+    if type(src) ~= 'number' or src <= 0 then return end
+    ensureSnapshot(src)
+    applySnapshotToState(src)
 end)
 
 local function registerNamespace(ns)
@@ -266,17 +211,19 @@ local function registerNamespace(ns)
         local src = source
         if type(src) ~= 'number' or src <= 0 then return end
         if type(delta) ~= 'table' then return end
-        local payload = json.encode(delta)
-        if exceededRate(src, ns, #payload) then return end
+
+        local payloadSize = #json.encode(delta)
+        if exceededRate(src, ns, payloadSize) then
+            dbg('rate limit triggered src=%d ns=%s size=%d', src, ns, payloadSize)
+            return
+        end
 
         local snap = ensureSnapshot(src)
         snap[ns] = snap[ns] or {}
         local clamped = clampNamespace(ns, delta)
-
         local before = json.encode(snap[ns])
         mergeDelta(snap[ns], clamped)
         snap.ts = os.time()
-
         local after = json.encode(snap[ns])
         if before ~= after then
             setStateBag(src, ns, snap[ns])
@@ -286,37 +233,12 @@ local function registerNamespace(ns)
             end
         end
     end)
-    dbg('registered %s for framework=%s', evt, Adapter.name)
+    dbg('registered namespace %s via adapter=%s', ns, Adapter.name or 'unknown')
 end
 
 for _, ns in ipairs(Config.Namespaces or {}) do
     registerNamespace(ns)
 end
-
-AddEventHandler('playerConnecting', function()
-    local src = source
-    if type(src) ~= 'number' or src <= 0 then return end
-    ensureSnapshot(src)
-end)
-
-AddEventHandler('playerDropped', function()
-    local src = source
-    if type(src) ~= 'number' or src <= 0 then return end
-    flushDirty()
-    if SNAP[src] then
-        persistOne(src)
-        SNAP[src], RATE[src] = nil, nil
-    end
-end)
-
-RegisterNetEvent('survival:hub:requestSync', function()
-    local src = source
-    if type(src) ~= 'number' or src <= 0 then return end
-    local snap = ensureSnapshot(src)
-    for _, ns in ipairs(Config.Namespaces or {}) do
-        setStateBag(src, ns, snap[ns])
-    end
-end)
 
 exports('getState', function(src)
     if type(src) ~= 'number' then return nil end
@@ -324,8 +246,10 @@ exports('getState', function(src)
 end)
 
 exports('update', function(src, ns, delta)
-    if type(src) ~= 'number' or type(ns) ~= 'string' or type(delta) ~= 'table' then return false end
+    if type(src) ~= 'number' or src <= 0 then return false end
+    if type(ns) ~= 'string' or type(delta) ~= 'table' then return false end
     ns = ns:lower()
+
     local allowed = false
     for _, name in ipairs(Config.Namespaces or {}) do
         if name == ns then allowed = true break end
@@ -334,14 +258,12 @@ exports('update', function(src, ns, delta)
 
     local snap = ensureSnapshot(src)
     snap[ns] = snap[ns] or {}
-    local clamped = clampNamespace(ns, delta)
-    mergeDelta(snap[ns], clamped)
+    mergeDelta(snap[ns], clampNamespace(ns, delta))
     setStateBag(src, ns, snap[ns])
     DIRTY[src] = true
     return true
 end)
 
 CreateThread(function()
-    ensureSchema()
-    dbg('initialised hub adapter=%s oxmysql=%s', Adapter.name, tostring(hasOx))
+    dbg('hub initialised adapter=%s hasOx=%s', Adapter.name or 'unknown', tostring(hasOx))
 end)

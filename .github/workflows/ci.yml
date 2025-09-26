@@ -1,0 +1,21 @@
+name: CI
+
+on:
+  push:
+    branches: [ main, master ]
+  pull_request:
+
+jobs:
+  lint-and-test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Lua and tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y lua5.4 luarocks
+          sudo luarocks install luacheck
+      - name: Lint
+        run: luacheck survival_* survival_shared tests --config .luacheckrc
+      - name: Run tests
+        run: lua5.4 tests/adapter_spec.lua

@@ -1,6 +1,7 @@
 Persist = {}
 
-local useDb = Config.Persistence.Enabled and (MySQL ~= nil)
+local hasOx = GetResourceState and GetResourceState('oxmysql') == 'started' and MySQL ~= nil
+local useDb = Config.Persistence.Enabled and hasOx
 local tableName = Config.Persistence.TableName
 
 local function log(...)

@@ -7,6 +7,7 @@ description 'Headless environment pipeline (weather/time/wetness/wind/radiation)
 author 'FiveM Realistic Survival Bundle'
 
 shared_scripts {
+  '@survival_shared/framework.lua',
   'config.lua'
 }
 
